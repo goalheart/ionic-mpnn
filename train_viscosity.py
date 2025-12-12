@@ -1,4 +1,6 @@
-# train_viscosity_from_pkl.py
+# train_viscosity.py
+# 训练粘度预测模型：基于离子对 SMILES 预测粘度
+# 依据论文 "Predicting Ionic Liquid Materials Properties from Chemical Structure"
 import os
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 import pickle
@@ -11,14 +13,16 @@ from tensorflow.keras.regularizers import l2
 from sklearn.model_selection import train_test_split
 from models.layers import BondMatrixMessage, GatedUpdate, GlobalSumPool, Reduce
 import matplotlib.pyplot as plt
-# -------------------
-EPS = 1e-6
-# -------------------
 
-def r2_metric(y_true, y_pred):
-    ss_res = tf.reduce_sum(tf.square(y_true - y_pred))
-    ss_tot = tf.reduce_sum(tf.square(y_true - tf.reduce_mean(y_true)))
-    return 1 - ss_res / (ss_tot + EPS)
+EPS = 1e-6
+
+def r2_numpy(y_true, y_pred):
+    ss_res = np.sum((y_true - y_pred)**2)
+    ss_tot = np.sum((y_true - np.mean(y_true))**2)
+    return 1.0 - ss_res / (ss_tot + EPS)
+
+def combine_proj(inputs):
+    return inputs[0] + inputs[1]
 
 def pad_sequences_1d(seq_list, max_len=None, pad_val=0):
     if max_len is None:
@@ -26,10 +30,17 @@ def pad_sequences_1d(seq_list, max_len=None, pad_val=0):
     padded = [s + [pad_val] * (max_len - len(s)) for s in seq_list]
     return np.array(padded, dtype=np.int32)
 
+# split params
+# compute log_eta pred: A + B / (T + C)
+def get_A(x): return tf.expand_dims(x[:, 0], -1)
+def get_B(x): return tf.expand_dims(x[:, 1], -1)
+def get_C(x): return tf.expand_dims(x[:, 2], -1)
+def softplus_C(x): return tf.nn.softplus(x) + 1e-6
+def compute_log_eta(inputs): 
+    A, B, T, C_pos = inputs
+    return A + tf.divide(B, T + C_pos)
+
 def preprocess_edges_and_bonds(edge_list, bond_list, max_edges=None):
-    """
-    Create directed edges (src,tgt) and bond ids. Use 0 for padding.
-    """
     processed_edges = []
     processed_bonds = []
     for edges, bonds in zip(edge_list, bond_list):
@@ -48,7 +59,6 @@ def preprocess_edges_and_bonds(edge_list, bond_list, max_edges=None):
     else:
         max_len = max_edges * 2
 
-    # pad with (0,0) and bond id 0 (embedding mask_zero=True will ensure zeros)
     processed_edges = [e + [[0,0]] * (max_len - len(e)) if len(e) < max_len else e[:max_len] for e in processed_edges]
     processed_bonds = [b + [0] * (max_len - len(b)) if len(b) < max_len else b[:max_len] for b in processed_bonds]
 
@@ -68,152 +78,87 @@ def build_model(atom_vocab_size, bond_vocab_size,
 
     T_input = Input(shape=(1,), dtype=tf.float32, name='temperature')
 
-    # Shared embeddings (mask_zero -> index 0 used as padding)
     atom_embedding = Embedding(atom_vocab_size, atom_dim, mask_zero=True, name='atom_embedding')
     bond_embedding = Embedding(bond_vocab_size, bond_dim, mask_zero=True, name='bond_embedding')
 
-    # --- cation encoder ---
-    cat_atom_emb = atom_embedding(cat_atom_in)    # (B, N, D)
-    cat_bond_emb = bond_embedding(cat_bond_in)    # (B, E, D_b)
-
+    # cation encoder
+    cat_atom_emb = atom_embedding(cat_atom_in)
+    cat_bond_emb = bond_embedding(cat_bond_in)
     atom_state = cat_atom_emb
     for i in range(num_steps):
         messages = BondMatrixMessage(atom_dim, bond_dim, name=f'cat_bmm_{i}')([atom_state, cat_bond_emb, cat_conn_in])
         aggregated = Reduce(name=f'cat_reduce_{i}')([messages, cat_conn_in[:,:,1], atom_state])
         atom_state = GatedUpdate(atom_dim, dropout_rate=dropout_rate, name=f'cat_update_{i}')([atom_state, aggregated])
-
     fp_cat = GlobalSumPool()([atom_state, cat_atom_in])
     fp_cat = Dense(fp_size, activation='relu', kernel_regularizer=l2(1e-5))(fp_cat)
     fp_cat = Dropout(dropout_rate)(fp_cat)
 
-    # --- anion encoder (shared embeddings & same architecture) ---
+    # anion encoder
     an_atom_emb = atom_embedding(an_atom_in)
     an_bond_emb = bond_embedding(an_bond_in)
-
     atom_state = an_atom_emb
     for i in range(num_steps):
         messages = BondMatrixMessage(atom_dim, bond_dim, name=f'an_bmm_{i}')([atom_state, an_bond_emb, an_conn_in])
         aggregated = Reduce(name=f'an_reduce_{i}')([messages, an_conn_in[:,:,1], atom_state])
         atom_state = GatedUpdate(atom_dim, dropout_rate=dropout_rate, name=f'an_update_{i}')([atom_state, aggregated])
-
     fp_an = GlobalSumPool()([atom_state, an_atom_in])
     fp_an = Dense(fp_size, activation='relu', kernel_regularizer=l2(1e-5))(fp_an)
     fp_an = Dropout(dropout_rate)(fp_an)
 
-    # combine
-    cat_proj = Dense(mixing_size, activation='relu')(fp_cat)
-    an_proj = Dense(mixing_size, activation='relu')(fp_an)
-    combined = Lambda(lambda x: x[0] + x[1])([cat_proj, an_proj])
+    cat_proj = Dense(mixing_size, activation='relu', name='cat_proj')(fp_cat)
+    an_proj = Dense(mixing_size, activation='relu', name='an_proj')(fp_an)
 
-    # Viscosity head => output 3 params A, B, C
+    # combined = Lambda(lambda x: x[0] + x[1], name='combine')([cat_proj, an_proj])
+    combined = Lambda(combine_proj, name='combine')([cat_proj, an_proj])
+
+
     visc_params = Dense(3, name='visc_params')(combined)
-    # Use inverse temperature (1/T) as input to head
-    T_inv = Lambda(lambda x: 1.0 / (x + 1e-6), name='T_inv')(T_input)
 
-    # Map to log_eta = A + B / (T + C)  -> but we will implement with parameters
-    # Split params
-    A = Lambda(lambda x: tf.expand_dims(x[:, 0], -1))(visc_params)
-    B = Lambda(lambda x: tf.expand_dims(x[:, 1], -1))(visc_params)
-    C = Lambda(lambda x: tf.expand_dims(x[:, 2], -1))(visc_params)
-    # ensure C is positive by softplus to avoid divide by negative small values
-    C_pos = Lambda(lambda x: tf.nn.softplus(x) + 1e-6)(C)
 
-    # compute log_eta_pred
-    log_eta_pred = Lambda(lambda x: x[0] + tf.divide(x[1], x[2] + x[3]))([A, B, T_input, C_pos])
-    # (we keep T_input + C to match A + B/(T+C) form)
+    A = Lambda(get_A, name='A')(visc_params)
+    B = Lambda(get_B, name='B')(visc_params)
+    C = Lambda(get_C, name='C')(visc_params)
+    C_pos = Lambda(softplus_C, name='C_pos')(C)
+    log_eta_pred = Lambda(compute_log_eta, name='log_eta')([A, B, T_input, C_pos])
 
-    model = Model(
-        inputs=[cat_atom_in, cat_bond_in, cat_conn_in,
-                an_atom_in, an_bond_in, an_conn_in,
-                T_input],
-        outputs=log_eta_pred
-    )
 
+    model = Model(inputs=[cat_atom_in, cat_bond_in, cat_conn_in,
+                          an_atom_in, an_bond_in, an_conn_in,
+                          T_input],
+                  outputs=log_eta_pred)
     opt = tf.keras.optimizers.Adam(learning_rate=3e-4, clipnorm=1.0)
+    def r2_metric(y_true, y_pred):
+        ss_res = tf.reduce_sum(tf.square(y_true - y_pred))
+        ss_tot = tf.reduce_sum(tf.square(y_true - tf.reduce_mean(y_true)))
+        return 1 - ss_res / (ss_tot + EPS)
     model.compile(optimizer=opt, loss='mse', metrics=[r2_metric])
-
     return model
-
 
 def save_plot(path):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     plt.savefig(path, dpi=300, bbox_inches="tight")
     plt.close()
 
-def visualize_results(history, model, x_train, y_train, x_dev, y_dev):
-    print("Generating visualizations...")
-
-    # predict
-    y_pred_train = model.predict(x_train).flatten()
-    y_pred_dev = model.predict(x_dev).flatten()
-
-    # ----------------------
-    # 1. Train/Val Loss curve
-    # ----------------------
-    plt.figure()
-    plt.plot(history.history['loss'], label='Train')
-    plt.plot(history.history['val_loss'], label='Val')
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss (MSE)")
-    plt.legend()
-    plt.title("Training Curve")
-    save_plot("results/training_curve.png")
-
-    # ----------------------
-    # 2. Pred vs True (log10)
-    # ----------------------
+def visualize_pred_vs_true(y_train, y_pred_train, y_dev, y_pred_dev, outpath):
     plt.figure(figsize=(6,6))
     plt.scatter(y_train, y_pred_train, s=8, alpha=0.3, label='Train')
-    plt.scatter(y_dev, y_pred_dev, s=15, alpha=0.6, label='Val')
-    low = min(y_train.min(), y_dev.min())
-    high = max(y_train.max(), y_dev.max())
+    plt.scatter(y_dev, y_pred_dev, s=15, alpha=0.6, label='Dev')
+    low = min(np.min(y_train), np.min(y_dev))
+    high = max(np.max(y_train), np.max(y_dev))
     plt.plot([low, high], [low, high], 'k--')
     plt.xlabel("True Log10(η)")
     plt.ylabel("Predicted Log10(η)")
     plt.legend()
-    plt.title("Predicted vs True")
-    save_plot("results/vis_pred_vs_true.png")
-
-    # ----------------------
-    # 3. Residual plot
-    # ----------------------
-    residuals = y_pred_dev - y_dev
-    plt.figure()
-    plt.scatter(y_dev, residuals, alpha=0.6, s=10)
-    plt.axhline(0, color='k', linestyle='--')
-    plt.xlabel("True Log10(η)")
-    plt.ylabel("Residual")
-    plt.title("Residual Plot (Val)")
-    save_plot("results/vis_residual_plot.png")
-
-    # ----------------------
-    # 4. Residual histogram
-    # ----------------------
-    plt.figure()
-    plt.hist(residuals, bins=40, color="orange", alpha=0.8)
-    plt.xlabel("Residual (log10 cP)")
-    plt.ylabel("Count")
-    plt.title("Residual Histogram")
-    save_plot("results/vis_residual_hist.png")
-
-    # ----------------------
-    # 5. Distribution comparison
-    # ----------------------
-    plt.figure()
-    plt.hist(y_dev, bins=40, alpha=0.6, label="True")
-    plt.hist(y_pred_dev, bins=40, alpha=0.6, label="Predicted")
-    plt.legend()
-    plt.title("Distribution of True vs Predicted")
-    save_plot("results/vis_dist_compare.png")
-
-    print("All figures saved in results/")
-
+    plt.title("Viscosity: Predicted vs True")
+    save_plot(outpath)
 
 def main():
-    # load data
-    with open('data/viscosity_id_data.pkl', 'rb') as f:
+    DATA_VISC = 'data/viscosity_id_data.pkl'
+    VOCAB = 'data/vocab.pkl'
+
+    with open(DATA_VISC, 'rb') as f:
         data = pickle.load(f)
-    with open('data/vocab.pkl', 'rb') as f:
+    with open(VOCAB, 'rb') as f:
         vocab = pickle.load(f)
 
     atom_vocab_size = vocab['atom_vocab_size']
@@ -268,13 +213,12 @@ def main():
     T_dev = temps[dev_mask]
     y_dev = labels[dev_mask]
 
-    print(f"Train / Val sizes: {len(y_train)} / {len(y_dev)}")
+    print(f"Train / Dev sizes: {len(y_train)} / {len(y_dev)}")
 
     model = build_model(atom_vocab_size+1, bond_vocab_size+1,
                         atom_dim=32, bond_dim=8, fp_size=32, mixing_size=20, num_steps=4, dropout_rate=0.2)
     model.summary()
 
-    # callbacks
     def lr_schedule(epoch, lr):
         if epoch > 0 and epoch % 200 == 0:
             return lr * 0.5
@@ -313,18 +257,20 @@ def main():
 
     os.makedirs('models', exist_ok=True)
     model.save('models/viscosity_final.keras')
-    print("Saved model to models/viscosity_final.keras")
+    print("Saved viscosity model to models/viscosity_final.keras")
 
-    # compute exact R2 on dev
+    # compute R2s
     y_pred_dev = model.predict(x_dev, batch_size=32).flatten()
-    mean_y = np.mean(y_dev)
-    ss_tot = np.sum((y_dev - mean_y)**2)
-    ss_res = np.sum((y_dev - y_pred_dev)**2)
-    R2 = 1 - ss_res / (ss_tot + EPS)
-    mae = np.mean(np.abs(y_dev - y_pred_dev))
-    print(f"Dis_Dev R2: {R2:.4f}, Dis_MAE(log10 cP): {mae:.4f}")
-    visualize_results(history, model, x_train, y_train, x_dev, y_dev)
-    
+    y_pred_train = model.predict(x_train, batch_size=32).flatten()
+    R2_dev = r2_numpy(y_dev.flatten(), y_pred_dev)
+    R2_train = r2_numpy(y_train.flatten(), y_pred_train)
+    mae_dev = np.mean(np.abs(y_dev.flatten() - y_pred_dev))
+    mae_train = np.mean(np.abs(y_train.flatten() - y_pred_train))
+    print(f"R2_train: {R2_train:.4f}, MAE_train(log10 cP): {mae_train:.4f}")
+    print(f"R2_dev:   {R2_dev:.4f}, MAE_dev(log10 cP):   {mae_dev:.4f}")
+
+    # save Figure 2a style plot
+    visualize_pred_vs_true(y_train.flatten(), y_pred_train, y_dev.flatten(), y_pred_dev, 'results/figure2_a_viscosity.png')
 
 if __name__ == '__main__':
     main()

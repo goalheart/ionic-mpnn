@@ -48,7 +48,8 @@ class Reduce(Layer):
     def compute_output_shape(self, input_shape):
         _, _, ref_shape = input_shape
         return ref_shape
-
+    
+@register_keras_serializable()
 class BondMatrixMessage(Layer):
     """
     Compute messages: for each edge, message = A_e @ h_src
