@@ -10,7 +10,7 @@ from tensorflow.keras.callbacks import EarlyStopping, LearningRateScheduler
 from tensorflow.keras.regularizers import l2
 from sklearn.model_selection import train_test_split
 from models.layers import BondMatrixMessage, GatedUpdate, GlobalSumPool, Reduce
-
+import matplotlib.pyplot as plt
 # -------------------
 EPS = 1e-6
 # -------------------
@@ -249,5 +249,80 @@ def main():
     mae = np.mean(np.abs(y_dev - y_pred_dev))
     print(f"Dev R2: {R2:.4f}, MAE(log10 cP): {mae:.4f}")
 
+def save_plot(path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    plt.savefig(path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+def visualize_results(model, x_train, y_train, x_dev, y_dev):
+    print("Generating visualizations...")
+
+    # predict
+    y_pred_train = model.predict(x_train).flatten()
+    y_pred_dev = model.predict(x_dev).flatten()
+
+    # ----------------------
+    # 1. Train/Val Loss curve
+    # ----------------------
+    plt.figure()
+    plt.plot(history.history['loss'], label='Train')
+    plt.plot(history.history['val_loss'], label='Val')
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss (MSE)")
+    plt.legend()
+    plt.title("Training Curve")
+    save_plot("results/training_curve.png")
+
+    # ----------------------
+    # 2. Pred vs True (log10)
+    # ----------------------
+    plt.figure(figsize=(6,6))
+    plt.scatter(y_train, y_pred_train, s=8, alpha=0.3, label='Train')
+    plt.scatter(y_dev, y_pred_dev, s=15, alpha=0.6, label='Val')
+    low = min(y_train.min(), y_dev.min())
+    high = max(y_train.max(), y_dev.max())
+    plt.plot([low, high], [low, high], 'k--')
+    plt.xlabel("True Log10(η)")
+    plt.ylabel("Predicted Log10(η)")
+    plt.legend()
+    plt.title("Predicted vs True")
+    save_plot("results/pred_vs_true.png")
+
+    # ----------------------
+    # 3. Residual plot
+    # ----------------------
+    residuals = y_pred_dev - y_dev
+    plt.figure()
+    plt.scatter(y_dev, residuals, alpha=0.6, s=10)
+    plt.axhline(0, color='k', linestyle='--')
+    plt.xlabel("True Log10(η)")
+    plt.ylabel("Residual")
+    plt.title("Residual Plot (Val)")
+    save_plot("results/residuals.png")
+
+    # ----------------------
+    # 4. Residual histogram
+    # ----------------------
+    plt.figure()
+    plt.hist(residuals, bins=40, color="orange", alpha=0.8)
+    plt.xlabel("Residual (log10 cP)")
+    plt.ylabel("Count")
+    plt.title("Residual Histogram")
+    save_plot("results/residual_hist.png")
+
+    # ----------------------
+    # 5. Distribution comparison
+    # ----------------------
+    plt.figure()
+    plt.hist(y_dev, bins=40, alpha=0.6, label="True")
+    plt.hist(y_pred_dev, bins=40, alpha=0.6, label="Predicted")
+    plt.legend()
+    plt.title("Distribution of True vs Predicted")
+    save_plot("results/dist_compare.png")
+
+    print("All figures saved in results/")
+
+    visualize_results(model, x_train, y_train, x_dev, y_dev)
+    
 if __name__ == '__main__':
     main()
