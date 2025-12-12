@@ -1,59 +1,58 @@
 # models/layers.py
 import tensorflow as tf
-from tensorflow.keras.layers import Layer, GRU, GRUCell
-tf_layers = tf.keras.layers
-
-class Gather(tf_layers.Layer):
-    def call(self, inputs, mask=None, **kwargs):
-        reference, indices = inputs
-        return tf.gather(reference, indices, batch_dims=1)
-
+from tensorflow.keras.layers import Layer, Dense, LayerNormalization
+import tensorflow.keras.backend as K
 
 class Reduce(Layer):
-    def __init__(self, reduction='sum', **kwargs):
+    """
+    Aggregate messages to target atoms, ignoring tgt_idx == 0 (padding).
+    Inputs:
+      - messages: (B, E, D)
+      - tgt_idx: (B, E)  (0 means padding)
+      - atom_ref: (B, N, D)  (used to infer N)
+    Output:
+      - aggregated: (B, N, D)
+    """
+    def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.reduction = reduction
-
-    def call(self, inputs, mask=None):
-        messages, tgt_indices, atom_features_ref = inputs
-        # messages: (B, E, D)
-        # tgt_indices: (B, E)
-        
+    def call(self, inputs):
+        messages, tgt_idx, atom_ref = inputs
         batch_size = tf.shape(messages)[0]
-        num_atoms = tf.shape(atom_features_ref)[1]
+        num_edges = tf.shape(messages)[1]
         atom_dim = tf.shape(messages)[2]
+        num_atoms = tf.shape(atom_ref)[1]
 
-        # 展平 batch 维度以进行 segment sum
-        # 我们需要为每个 batch 生成唯一的 segment id
-        # segment_id = batch_index * max_atoms + atom_index
-        
-        # 这种偏移方法需要知道 max_atoms，动态获取：
-        offset = tf.range(batch_size, dtype=tf.int32) * num_atoms
-        offset = tf.expand_dims(offset, -1) # (B, 1)
-        
-        # 调整 indices: (B, E) + (B, 1) -> (B, E)
-        # 此时 indices 中的值在 [0, B*N) 范围内全局唯一
-        flat_indices = tgt_indices + offset
-        
-        flat_messages = tf.reshape(messages, [-1, atom_dim])
-        flat_indices = tf.reshape(flat_indices, [-1])
-        
-        # 聚合
-        total_atoms = batch_size * num_atoms
-        aggregated_flat = tf.math.unsorted_segment_sum(
-            flat_messages, flat_indices, num_segments=total_atoms
+        # flatten
+        batch_idx = tf.range(batch_size, dtype=tf.int32)[:, None]  # (B,1)
+        batch_idx = tf.tile(batch_idx, [1, num_edges])            # (B,E)
+        full_idx = tf.stack([batch_idx, tgt_idx], axis=-1)        # (B,E,2)
+        full_idx_flat = tf.reshape(full_idx, [-1, 2])             # (B*E, 2)
+
+        messages_flat = tf.reshape(messages, [-1, atom_dim])     # (B*E, D)
+
+        # mask out tgt == 0 (padding)
+        tgt_flat = tf.reshape(tgt_idx, [-1])
+        valid_mask = tf.where(tgt_flat > 0, True, False)
+
+        valid_indices = tf.boolean_mask(full_idx_flat, valid_mask)
+        valid_updates = tf.boolean_mask(messages_flat, valid_mask)
+
+        aggregated = tf.scatter_nd(
+            valid_indices,
+            valid_updates,
+            shape=(batch_size, num_atoms, atom_dim)
         )
-        
-        # 恢复形状 (B, N, D)
-        aggregated = tf.reshape(aggregated_flat, [batch_size, num_atoms, atom_dim])
-        
+
         return aggregated
+
+    def compute_output_shape(self, input_shape):
+        _, _, ref_shape = input_shape
+        return ref_shape
 
 class BondMatrixMessage(Layer):
     """
-    实现论文中的消息计算：
-        m_v^{t+1} = sum_{w in N(v)} A_{e_vw} h_w^t
-    其中 A_e 由 bond embedding 通过可学习张量映射得到。
+    Compute messages: for each edge, message = A_e @ h_src
+    where A_e is obtained from bond embedding via a learned tensor.
     """
     def __init__(self, atom_dim, bond_dim, **kwargs):
         super().__init__(**kwargs)
@@ -61,136 +60,102 @@ class BondMatrixMessage(Layer):
         self.bond_dim = bond_dim
 
     def build(self, input_shape):
-        self.bond_transform = self.add_weight(
-            shape=(self.bond_dim, self.atom_dim * self.atom_dim),
-            initializer='glorot_uniform',
-            name='bond_transform'
-        )
-        self.gather = Gather()
-        super().build(input_shape)
-
-    def call(self, inputs, mask=None):
-        atom_state, bond_state, connectivity = inputs
-        src_idx = connectivity[:, :, 0]  # (B, E)
-        src_atoms = self.gather([atom_state, src_idx])  # (B, E, atom_dim)
-
-        # (B, E, bond_dim) @ (bond_dim, atom_dim*atom_dim) -> (B, E, atom_dim*atom_dim)
-        bond_weights = tf.matmul(bond_state, tf.reshape(self.bond_transform, [self.bond_dim, -1]))
-        bond_weights = tf.reshape(bond_weights, [-1, tf.shape(bond_state)[1], self.atom_dim, self.atom_dim])
-
-        src_exp = tf.expand_dims(src_atoms, -1)  # (B, E, atom_dim, 1)
-        messages = tf.matmul(bond_weights, src_exp)  # (B, E, atom_dim, 1)
-        messages = tf.squeeze(messages, axis=-1)  # (B, E, atom_dim)
-
-        return messages
-
-    def get_config(self):
-        config = super().get_config()
-        config.update({
-            "atom_dim": self.atom_dim,
-            "bond_dim": self.bond_dim,
-        })
-        return config
-
-
-class GRUUpdate(Layer):
-    def __init__(self, atom_dim, **kwargs):
-        super().__init__(**kwargs)
-        self.atom_dim = atom_dim
-        # state_size 是 GRUCell 必需的属性
-        self.state_size = atom_dim 
-
-    def build(self, input_shape):
-        self.gru_cell = GRUCell(self.atom_dim)
-        self.reduce = Reduce(reduction='sum')
-        super().build(input_shape)
-
-    def call(self, inputs, mask=None):
-        atom_state, messages, connectivity = inputs
-        tgt_idx = connectivity[:, :, 1]
-
-        # 1. 聚合消息 (B, N, D)
-        aggregated_messages = self.reduce([messages, tgt_idx, atom_state], mask=mask)
-
-        # 2. 展平以通过 Cell 处理 (B*N, D)
-        batch_size = tf.shape(atom_state)[0]
-        num_atoms = tf.shape(atom_state)[1]
-        
-        flat_inputs = tf.reshape(aggregated_messages, [-1, self.atom_dim])
-        flat_states = tf.reshape(atom_state, [-1, self.atom_dim])
-        
-        # GRUCell 返回 (output, [new_state])
-        # 对于 GRU，output == new_state
-        new_flat_state, _ = self.gru_cell(flat_inputs, states=[flat_states])
-        
-        # 3. 恢复形状 (B, N, D)
-        updated_state = tf.reshape(new_flat_state, [batch_size, num_atoms, self.atom_dim])
-        
-        return updated_state
-
-
-class GlobalSumPool(Layer):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-
-    def call(self, inputs):
-        if isinstance(inputs, (list, tuple)):
-            atom_features, atom_ids = inputs
-            mask = tf.cast(atom_ids > 0, tf.float32)  # 0 是 pad
-            mask = tf.expand_dims(mask, -1)
-            return tf.reduce_sum(atom_features * mask, axis=1)
-        else:
-            return tf.reduce_sum(inputs, axis=1)
-
-
-class MessagePassing(Layer):
-    def __init__(self, atom_dim, bond_dim, **kwargs):
-        super().__init__(**kwargs)
-        self.atom_dim = atom_dim
-        self.bond_dim = bond_dim
-
-    def build(self, input_shape):
+        # bond_transform: (bond_dim, atom_dim, atom_dim)
         self.bond_transform = self.add_weight(
             shape=(self.bond_dim, self.atom_dim, self.atom_dim),
             initializer='glorot_uniform',
             name='bond_transform'
         )
-        self.gru = GRU(self.atom_dim, return_sequences=True)
         super().build(input_shape)
 
     def call(self, inputs):
-        atom_features, bond_features, connectivity = inputs
-        # atom_features: (B, N, D_a)
-        # bond_features: (B, E, D_b)
-        # connectivity: (B, E, 2)  [src, tgt]
+        atom_state, bond_state, connectivity = inputs
+        # atom_state: (B, N, D_a)
+        # bond_state: (B, E, D_b)
+        # connectivity: (B, E, 2)  src,tgt ; src==0 or tgt==0 is padding
 
-        # Transform bonds to (D_a, D_a) matrices
-        bond_weights = tf.einsum('bed,dlm->b elm', bond_features, self.bond_transform)  # (B, E, D_a, D_a)
+        src_idx = connectivity[:, :, 0]  # (B,E)
+        tgt_idx = connectivity[:, :, 1]  # (B,E)
 
-        # Gather source atom features
-        src_idx = connectivity[:, :, 0]  # (B, E)
-        src_atoms = tf.gather(atom_features, src_idx, batch_dims=1)  # (B, E, D_a)
+        # gather source atom features (src==0 -> gather atom embedding 0 -> zeros if embedding mask_zero=True)
+        src_atoms = tf.gather(atom_state, src_idx, batch_dims=1)  # (B,E,D_a)
 
-        # Compute messages: A_e @ h_w
-        messages = tf.einsum('b elm,b ek->b el', bond_weights, src_atoms)  # (B, E, D_a)
+        # convert bond_state -> (B,E,D_a,D_a) using tensordot
+        # bond_state: (B,E,D_b), bond_transform: (D_b, D_a, D_a)
+        # result: (B,E,D_a,D_a)
+        bond_mats = tf.tensordot(bond_state, self.bond_transform, axes=[[2], [0]])
 
-        # Aggregate to target atoms
-        tgt_idx = connectivity[:, :, 1]  # (B, E)
-        num_atoms = tf.shape(atom_features)[1]
-        batch_size = tf.shape(atom_features)[0]
+        # messages = bond_mats @ src_atoms[...,None] -> (B,E,D_a,1) -> squeeze -> (B,E,D_a)
+        src_exp = tf.expand_dims(src_atoms, -1)
+        messages = tf.matmul(bond_mats, src_exp)
+        messages = tf.squeeze(messages, axis=-1)
 
-        batch_indices = tf.range(batch_size, dtype=tf.int32)[:, None]  # (B, 1)
-        batch_indices = tf.tile(batch_indices, [1, tf.shape(tgt_idx)[1]])  # (B, E)
-        full_indices = tf.stack([batch_indices, tgt_idx], axis=-1)  # (B, E, 2)
-        full_indices = tf.reshape(full_indices, [-1, 2])  # (B*E, 2)
-        messages_flat = tf.reshape(messages, [-1, self.atom_dim])  # (B*E, D_a)
+        # mask invalid edges (src==0 or tgt==0)
+        valid = tf.logical_and(tf.greater(src_idx, 0), tf.greater(tgt_idx, 0))
+        valid = tf.cast(valid, tf.float32)
+        messages = messages * tf.expand_dims(valid, -1)
 
-        aggregated = tf.scatter_nd(
-            full_indices,
-            messages_flat,
-            (batch_size, num_atoms, self.atom_dim)
-        )
+        return messages
 
-        # Update with GRU
-        updated = self.gru(tf.concat([atom_features, aggregated], axis=-1))
-        return updated
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"atom_dim": self.atom_dim, "bond_dim": self.bond_dim})
+        return cfg
+
+class GatedUpdate(Layer):
+    """
+    Node update with gating similar to GRU but implemented in dense ops for efficiency.
+    Inputs:
+       - atom_state (B,N,D)
+       - aggregated_messages (B,N,D)
+    Output:
+       - updated_state (B,N,D) with residual connection and LayerNorm
+    """
+    def __init__(self, atom_dim, dropout_rate=0.0, **kwargs):
+        super().__init__(**kwargs)
+        self.atom_dim = atom_dim
+        self.dropout_rate = dropout_rate
+
+    def build(self, input_shape):
+        # We'll use Dense layers for gates and candidate
+        self.dense_z = Dense(self.atom_dim)
+        self.dense_r = Dense(self.atom_dim)
+        self.dense_h = Dense(self.atom_dim)
+        self.layernorm = LayerNormalization()
+        self.dropout = tf.keras.layers.Dropout(self.dropout_rate)
+        super().build(input_shape)
+
+    def call(self, inputs, training=None):
+        atom_state, agg = inputs  # both (B,N,D)
+        # compute gates
+        concat = tf.concat([atom_state, agg], axis=-1)  # (B,N,2D)
+        z = tf.nn.sigmoid(self.dense_z(concat))
+        r = tf.nn.sigmoid(self.dense_r(concat))
+        # candidate
+        r_state = r * atom_state
+        h_input = tf.concat([r_state, agg], axis=-1)
+        h_tilde = tf.nn.tanh(self.dense_h(h_input))
+        # update
+        new_state = (1.0 - z) * atom_state + z * h_tilde
+        new_state = self.layernorm(new_state)
+        new_state = new_state + atom_state  # residual
+        new_state = self.dropout(new_state, training=training)
+        return new_state
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"atom_dim": self.atom_dim, "dropout_rate": self.dropout_rate})
+        return cfg
+
+class GlobalSumPool(Layer):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+    def call(self, inputs):
+        # inputs can be [atom_features, atom_ids]
+        if isinstance(inputs, (list, tuple)):
+            atom_features, atom_ids = inputs
+            mask = tf.cast(tf.greater(atom_ids, 0), tf.float32)  # (B,N)
+            mask = tf.expand_dims(mask, -1)
+            return tf.reduce_sum(atom_features * mask, axis=1)
+        else:
+            return tf.reduce_sum(inputs, axis=1)
