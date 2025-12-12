@@ -161,7 +161,8 @@ def main():
     an_bond_in = Input(shape=(None,), dtype=tf.int32, name='an_bond')
     an_conn_in = Input(shape=(None, 2), dtype=tf.int32, name='an_connectivity')
     T_input = Input(shape=(1,), dtype=tf.float32, name='temperature')
-
+    recip_T = Lambda(lambda t: 1000.0 / (t + 1e-6))(T_input)
+    
     # 共享嵌入层
     atom_embedding = Embedding(atom_vocab_size, atom_dim, mask_zero=False, name='atom_embedding')
     bond_embedding = Embedding(bond_vocab_size, bond_dim, mask_zero=False, name='bond_embedding')
@@ -208,10 +209,16 @@ def main():
     combined = Lambda(lambda x: x[0] + x[1])([cat_proj, an_proj])
 
     # 粘度预测头：A + B / T（Arrhenius-like）
-    visc_params = Dense(2, name='visc_params')(combined)
+    # 1. 预测 Arrhenius 参数 A 和 B (输出维度改为 2)
+    # A 是无穷高温粘度 (截距), B 是活化能相关项 (斜率)
+    visc_params = Dense(2, name='visc_params', kernel_initializer='normal')(combined)
     A = visc_params[:, 0:1]
     B = visc_params[:, 1:2]
-    log_eta_pred = Lambda(lambda x: x[0] + tf.divide(x[1], x[2] + 1e-6))([A, B, T_input])
+
+    log_eta_pred = Lambda(lambda x: x[0] + x[1] * x[2])([A, B, recip_T])
+    # log_eta_pred = Lambda(lambda x: x[0] + tf.divide(x[1], x[2] + 1e-6))(
+    #     [A, B, T_input]
+    # )
 
     model = Model(
         inputs=[
@@ -271,7 +278,7 @@ def main():
         epochs=100,
         batch_size=32,
         callbacks=[lr_callback, early_stop],
-        verbose=1
+        verbose=2
     )
 
     # 保存模型

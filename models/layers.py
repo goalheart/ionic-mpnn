@@ -1,7 +1,6 @@
 # models/layers.py
 import tensorflow as tf
-from tensorflow.keras.layers import Layer, GRU
-
+from tensorflow.keras.layers import Layer, GRU, GRUCell
 tf_layers = tf.keras.layers
 
 class Gather(tf_layers.Layer):
@@ -11,56 +10,44 @@ class Gather(tf_layers.Layer):
 
 
 class Reduce(Layer):
-    """
-    根据 connectivity 中的目标索引（tgt_idx）将消息聚合到原子上。
-    输入: [messages, tgt_indices, atom_features_ref]
-      - messages: (B, E, D)        每条边的消息
-      - tgt_indices: (B, E)        每条边的目标原子索引（从 0 开始，0 可能是 padding）
-      - atom_features_ref: (B, N, D) 用于推断原子数量 N 和特征维度 D
-    输出: (B, N, D) 聚合后的原子特征（按目标索引求和）
-    """
     def __init__(self, reduction='sum', **kwargs):
         super().__init__(**kwargs)
-        if reduction != 'sum':
-            raise NotImplementedError("Only 'sum' reduction is supported.")
         self.reduction = reduction
 
     def call(self, inputs, mask=None):
         messages, tgt_indices, atom_features_ref = inputs
+        # messages: (B, E, D)
+        # tgt_indices: (B, E)
+        
         batch_size = tf.shape(messages)[0]
-        num_edges = tf.shape(messages)[1]
+        num_atoms = tf.shape(atom_features_ref)[1]
         atom_dim = tf.shape(messages)[2]
-        num_atoms = tf.shape(atom_features_ref)[1]  # 从 reference 推断 N
 
-        # 构造 scatter_nd 所需的索引: (B*E, 2)
-        batch_idx = tf.range(batch_size, dtype=tf.int32)[:, None]  # (B, 1)
-        batch_idx = tf.tile(batch_idx, [1, num_edges])             # (B, E)
-        full_indices = tf.stack([batch_idx, tgt_indices], axis=-1) # (B, E, 2)
-        full_indices = tf.reshape(full_indices, [-1, 2])           # (B*E, 2)
-
-        # 展平消息: (B*E, D)
-        messages_flat = tf.reshape(messages, [-1, atom_dim])
-
-        # 使用 scatter_nd 聚合（自动对相同索引求和）
-        aggregated = tf.scatter_nd(
-            indices=full_indices,
-            updates=messages_flat,
-            shape=(batch_size, num_atoms, atom_dim)
+        # 展平 batch 维度以进行 segment sum
+        # 我们需要为每个 batch 生成唯一的 segment id
+        # segment_id = batch_index * max_atoms + atom_index
+        
+        # 这种偏移方法需要知道 max_atoms，动态获取：
+        offset = tf.range(batch_size, dtype=tf.int32) * num_atoms
+        offset = tf.expand_dims(offset, -1) # (B, 1)
+        
+        # 调整 indices: (B, E) + (B, 1) -> (B, E)
+        # 此时 indices 中的值在 [0, B*N) 范围内全局唯一
+        flat_indices = tgt_indices + offset
+        
+        flat_messages = tf.reshape(messages, [-1, atom_dim])
+        flat_indices = tf.reshape(flat_indices, [-1])
+        
+        # 聚合
+        total_atoms = batch_size * num_atoms
+        aggregated_flat = tf.math.unsorted_segment_sum(
+            flat_messages, flat_indices, num_segments=total_atoms
         )
-
+        
+        # 恢复形状 (B, N, D)
+        aggregated = tf.reshape(aggregated_flat, [batch_size, num_atoms, atom_dim])
+        
         return aggregated
-
-    def compute_output_shape(self, input_shape):
-        # input_shape: [msg_shape, idx_shape, ref_shape]
-        msg_shape, _, ref_shape = input_shape
-        # 输出形状与 atom_features_ref 相同
-        return ref_shape
-
-    def get_config(self):
-        config = super().get_config()
-        config.update({"reduction": self.reduction})
-        return config
-
 
 class BondMatrixMessage(Layer):
     """
@@ -107,43 +94,40 @@ class BondMatrixMessage(Layer):
 
 
 class GRUUpdate(Layer):
-    """
-    实现： h_v^{t+1} = GRU(h_v^t, m_v^{t+1})
-    输入: [atom_state, messages, connectivity]
-    输出: updated_atom_state
-    """
     def __init__(self, atom_dim, **kwargs):
         super().__init__(**kwargs)
         self.atom_dim = atom_dim
+        # state_size 是 GRUCell 必需的属性
+        self.state_size = atom_dim 
 
     def build(self, input_shape):
-        self.gru = GRU(self.atom_dim, return_sequences=True, name='atom_gru')
-        self.reduce = Reduce(reduction='sum')  # 用于聚合消息到节点
+        self.gru_cell = GRUCell(self.atom_dim)
+        self.reduce = Reduce(reduction='sum')
         super().build(input_shape)
 
     def call(self, inputs, mask=None):
         atom_state, messages, connectivity = inputs
-        tgt_idx = connectivity[:, :, 1]  # (B, E)
+        tgt_idx = connectivity[:, :, 1]
 
-        # 聚合消息到每个原子
-        aggregated = self.reduce([messages, tgt_idx, atom_state], mask=mask)  # (B, N, atom_dim)
+        # 1. 聚合消息 (B, N, D)
+        aggregated_messages = self.reduce([messages, tgt_idx, atom_state], mask=mask)
 
-        # GRU 更新：注意 GRU 期望 (B*N, 1, D) 的输入
+        # 2. 展平以通过 Cell 处理 (B*N, D)
         batch_size = tf.shape(atom_state)[0]
         num_atoms = tf.shape(atom_state)[1]
+        
+        flat_inputs = tf.reshape(aggregated_messages, [-1, self.atom_dim])
+        flat_states = tf.reshape(atom_state, [-1, self.atom_dim])
+        
+        # GRUCell 返回 (output, [new_state])
+        # 对于 GRU，output == new_state
+        new_flat_state, _ = self.gru_cell(flat_inputs, states=[flat_states])
+        
+        # 3. 恢复形状 (B, N, D)
+        updated_state = tf.reshape(new_flat_state, [batch_size, num_atoms, self.atom_dim])
+        
+        return updated_state
 
-        atom_flat = tf.reshape(atom_state, [batch_size * num_atoms, self.atom_dim])  # (B*N, D)
-        msg_flat = tf.reshape(aggregated, [batch_size * num_atoms, 1, self.atom_dim])  # (B*N, 1, D)
-
-        updated_flat = self.gru(msg_flat, initial_state=atom_flat)  # (B*N, 1, D)
-        updated = tf.reshape(updated_flat, [batch_size, num_atoms, self.atom_dim])  # (B, N, D)
-
-        return updated
-
-    def get_config(self):
-        config = super().get_config()
-        config.update({"atom_dim": self.atom_dim})
-        return config
 
 class GlobalSumPool(Layer):
     def __init__(self, **kwargs):
