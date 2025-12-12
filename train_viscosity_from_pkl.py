@@ -7,16 +7,13 @@ import numpy as np
 import os
 import matplotlib.pyplot as plt
 import tensorflow as tf
+import models
 from sklearn.model_selection import train_test_split
 from tensorflow.keras.layers import Input, Embedding, Dense, Lambda, Dropout
 from tensorflow.keras.models import Model
 from tensorflow.keras.callbacks import EarlyStopping, LearningRateScheduler
 from tensorflow.keras.regularizers import l2
-import nfp
-from nfp.layers import Reduce, GlobalSumPool
-
-# 导入我们重写的自定义层（需要先添加到 nfp/layers.py）
-from nfp.layers import BondMatrixMessage, GRUAtomUpdate
+from models.layers import Reduce, GlobalSumPool, BondMatrixMessage, GRUUpdate
 
 # 配置 TensorFlow 日志级别（抑制冗余信息）
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
@@ -38,36 +35,42 @@ def pad_sequences_1d(seq_list, max_len=None, pad_val=0):
     padded = [s + [pad_val] * (max_len - len(s)) for s in seq_list]
     return np.array(padded, dtype=np.int32)
 
-def preprocess_edges_for_nfp(edge_list, max_edges=None):
+def preprocess_edges_and_bonds(edge_list, bond_list, max_edges=None):
     """
-    将边索引转换为 nfp 兼容格式
-    nfp 要求 connectivity 形状为 (batch, num_edges, 2)，值范围 [0, num_atoms-1]
-    注意：nfp 中边是单向的，我们需要为每条无向边创建两条有向边
+    同时处理边索引和键类型，为每条无向边生成两条有向边及其对应的 bond ID。
     """
-    processed = []
-    for edges in edge_list:
-        # 将每条无向边转换为两条有向边
+    processed_edges = []
+    processed_bonds = []
+    for edges, bonds in zip(edge_list, bond_list):
         directed_edges = []
-        for src, tgt in edges:
+        directed_bonds = []
+        for (src, tgt), bond_id in zip(edges, bonds):
+            # 正向边
             directed_edges.append([src, tgt])
+            directed_bonds.append(bond_id)
+            # 反向边（使用相同的 bond ID，或可学习反向映射）
             directed_edges.append([tgt, src])
+            directed_bonds.append(bond_id)  # 通常正反向共享 bond type
         
-        # 填充至统一长度
         if max_edges is not None:
-            # 注意：因为每条边变成两条，所以实际需要 max_edges*2 个位置
-            pad_len = max_edges * 2 - len(directed_edges)
+            total_len = max_edges * 2
+            pad_len = total_len - len(directed_edges)
             if pad_len > 0:
                 directed_edges += [[0, 0]] * pad_len
-            processed.append(directed_edges[:max_edges*2])
+                directed_bonds += [0] * pad_len
+            processed_edges.append(directed_edges[:total_len])
+            processed_bonds.append(directed_bonds[:total_len])
         else:
-            processed.append(directed_edges)
+            processed_edges.append(directed_edges)
+            processed_bonds.append(directed_bonds)
     
-    # 确定填充长度
+    # 统一长度
     if max_edges is None:
-        max_len = max(len(e) for e in processed)
-        processed = [e + [[0,0]] * (max_len - len(e)) for e in processed]
+        max_len = max(len(e) for e in processed_edges)
+        processed_edges = [e + [[0,0]] * (max_len - len(e)) for e in processed_edges]
+        processed_bonds = [b + [0] * (max_len - len(b)) for b in processed_bonds]
     
-    return np.array(processed, dtype=np.int32)
+    return np.array(processed_edges, dtype=np.int32), np.array(processed_bonds, dtype=np.int32)
 
 # =============== 主函数 ===============
 def main():
@@ -107,21 +110,35 @@ def main():
 
     # 填充训练数据
     cat_atom_train = pad_sequences_1d([cat_atom_ids[i] for i in range(len(cat_atom_ids)) if train_mask[i]], max_atoms)
-    cat_bond_train = pad_sequences_1d([cat_bond_ids[i] for i in range(len(cat_bond_ids)) if train_mask[i]], max_bonds)
-    cat_edge_train = preprocess_edges_for_nfp([cat_edges[i] for i in range(len(cat_edges)) if train_mask[i]], max_edges)
+    cat_edge_train, cat_bond_train = preprocess_edges_and_bonds(
+        [cat_edges[i] for i in range(len(cat_edges)) if train_mask[i]],
+        [cat_bond_ids[i] for i in range(len(cat_bond_ids)) if train_mask[i]],
+        max_edges
+    )
+
     an_atom_train = pad_sequences_1d([an_atom_ids[i] for i in range(len(an_atom_ids)) if train_mask[i]], max_atoms)
-    an_bond_train = pad_sequences_1d([an_bond_ids[i] for i in range(len(an_bond_ids)) if train_mask[i]], max_bonds)
-    an_edge_train = preprocess_edges_for_nfp([an_edges[i] for i in range(len(an_edges)) if train_mask[i]], max_edges)
+    an_edge_train, an_bond_train = preprocess_edges_and_bonds(
+        [an_edges[i] for i in range(len(an_edges)) if train_mask[i]],
+        [an_bond_ids[i] for i in range(len(an_bond_ids)) if train_mask[i]],
+        max_edges
+    )
     T_train = temps[train_mask]
     y_train = labels[train_mask]
 
     # 填充验证数据
     cat_atom_dev = pad_sequences_1d([cat_atom_ids[i] for i in range(len(cat_atom_ids)) if dev_mask[i]], max_atoms)
-    cat_bond_dev = pad_sequences_1d([cat_bond_ids[i] for i in range(len(cat_bond_ids)) if dev_mask[i]], max_bonds)
-    cat_edge_dev = preprocess_edges_for_nfp([cat_edges[i] for i in range(len(cat_edges)) if dev_mask[i]], max_edges)
+    cat_edge_dev, cat_bond_dev = preprocess_edges_and_bonds(
+        [cat_edges[i] for i in range(len(cat_edges)) if dev_mask[i]],
+        [cat_bond_ids[i] for i in range(len(cat_bond_ids)) if dev_mask[i]],
+        max_edges
+    )
+
     an_atom_dev = pad_sequences_1d([an_atom_ids[i] for i in range(len(an_atom_ids)) if dev_mask[i]], max_atoms)
-    an_bond_dev = pad_sequences_1d([an_bond_ids[i] for i in range(len(an_bond_ids)) if dev_mask[i]], max_bonds)
-    an_edge_dev = preprocess_edges_for_nfp([an_edges[i] for i in range(len(an_edges)) if dev_mask[i]], max_edges)
+    an_edge_dev, an_bond_dev = preprocess_edges_and_bonds(
+        [an_edges[i] for i in range(len(an_edges)) if dev_mask[i]],
+        [an_bond_ids[i] for i in range(len(an_bond_ids)) if dev_mask[i]],
+        max_edges
+    )
     T_dev = temps[dev_mask]
     y_dev = labels[dev_mask]
 
@@ -146,8 +163,8 @@ def main():
     T_input = Input(shape=(1,), dtype=tf.float32, name='temperature')
 
     # 共享嵌入层
-    atom_embedding = Embedding(atom_vocab_size, atom_dim, mask_zero=True, name='atom_embedding')
-    bond_embedding = Embedding(bond_vocab_size, bond_dim, mask_zero=True, name='bond_embedding')
+    atom_embedding = Embedding(atom_vocab_size, atom_dim, mask_zero=False, name='atom_embedding')
+    bond_embedding = Embedding(bond_vocab_size, bond_dim, mask_zero=False, name='bond_embedding')
 
     # 阳离子编码
     cat_atom_emb = atom_embedding(cat_atom_in)  # (B, N, D_a)
@@ -159,8 +176,8 @@ def main():
         messages = BondMatrixMessage(atom_dim, bond_dim)(
             [atom_state, cat_bond_emb, cat_conn_in]
         )
-        atom_state = GRUAtomUpdate(atom_dim)(
-            [atom_state, messages]
+        atom_state = GRUUpdate(atom_dim)(
+            [atom_state, messages, cat_conn_in]   # 阳离子
         )
     
     # 生成分子指纹
@@ -177,8 +194,8 @@ def main():
         messages = BondMatrixMessage(atom_dim, bond_dim)(
             [atom_state, an_bond_emb, an_conn_in]
         )
-        atom_state = GRUAtomUpdate(atom_dim)(
-            [atom_state, messages]
+        atom_state = GRUUpdate(atom_dim)(
+            [atom_state, messages, an_conn_in]    # 阴离子
         )
     
     fp_an = GlobalSumPool()([atom_state, an_atom_in])
@@ -222,7 +239,7 @@ def main():
     lr_callback = LearningRateScheduler(lr_schedule)
     early_stop = EarlyStopping(
         monitor='val_loss',
-        patience=20,                # 验证损失20个epoch无改善则停止
+        patience=5,                # 验证损失20个epoch无改善则停止
         restore_best_weights=True   # 恢复最佳权重
     )
 

@@ -1,7 +1,66 @@
 # models/layers.py
 import tensorflow as tf
 from tensorflow.keras.layers import Layer, GRU
-from nfp.layers import Gather, Reduce
+
+tf_layers = tf.keras.layers
+
+class Gather(tf_layers.Layer):
+    def call(self, inputs, mask=None, **kwargs):
+        reference, indices = inputs
+        return tf.gather(reference, indices, batch_dims=1)
+
+
+class Reduce(Layer):
+    """
+    根据 connectivity 中的目标索引（tgt_idx）将消息聚合到原子上。
+    输入: [messages, tgt_indices, atom_features_ref]
+      - messages: (B, E, D)        每条边的消息
+      - tgt_indices: (B, E)        每条边的目标原子索引（从 0 开始，0 可能是 padding）
+      - atom_features_ref: (B, N, D) 用于推断原子数量 N 和特征维度 D
+    输出: (B, N, D) 聚合后的原子特征（按目标索引求和）
+    """
+    def __init__(self, reduction='sum', **kwargs):
+        super().__init__(**kwargs)
+        if reduction != 'sum':
+            raise NotImplementedError("Only 'sum' reduction is supported.")
+        self.reduction = reduction
+
+    def call(self, inputs, mask=None):
+        messages, tgt_indices, atom_features_ref = inputs
+        batch_size = tf.shape(messages)[0]
+        num_edges = tf.shape(messages)[1]
+        atom_dim = tf.shape(messages)[2]
+        num_atoms = tf.shape(atom_features_ref)[1]  # 从 reference 推断 N
+
+        # 构造 scatter_nd 所需的索引: (B*E, 2)
+        batch_idx = tf.range(batch_size, dtype=tf.int32)[:, None]  # (B, 1)
+        batch_idx = tf.tile(batch_idx, [1, num_edges])             # (B, E)
+        full_indices = tf.stack([batch_idx, tgt_indices], axis=-1) # (B, E, 2)
+        full_indices = tf.reshape(full_indices, [-1, 2])           # (B*E, 2)
+
+        # 展平消息: (B*E, D)
+        messages_flat = tf.reshape(messages, [-1, atom_dim])
+
+        # 使用 scatter_nd 聚合（自动对相同索引求和）
+        aggregated = tf.scatter_nd(
+            indices=full_indices,
+            updates=messages_flat,
+            shape=(batch_size, num_atoms, atom_dim)
+        )
+
+        return aggregated
+
+    def compute_output_shape(self, input_shape):
+        # input_shape: [msg_shape, idx_shape, ref_shape]
+        msg_shape, _, ref_shape = input_shape
+        # 输出形状与 atom_features_ref 相同
+        return ref_shape
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"reduction": self.reduction})
+        return config
+
 
 class BondMatrixMessage(Layer):
     """
