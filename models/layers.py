@@ -1,6 +1,7 @@
 # models/layers.py
 import tensorflow as tf
 from tensorflow.keras.layers import Layer, Dense, LayerNormalization
+from tensorflow.keras.utils import register_keras_serializable
 import tensorflow.keras.backend as K
 
 class Reduce(Layer):
