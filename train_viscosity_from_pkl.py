@@ -172,7 +172,7 @@ def visualize_results(history, model, x_train, y_train, x_dev, y_dev):
     plt.ylabel("Predicted Log10(η)")
     plt.legend()
     plt.title("Predicted vs True")
-    save_plot("results/pred_vs_true.png")
+    save_plot("results/vis_pred_vs_true.png")
 
     # ----------------------
     # 3. Residual plot
@@ -184,7 +184,7 @@ def visualize_results(history, model, x_train, y_train, x_dev, y_dev):
     plt.xlabel("True Log10(η)")
     plt.ylabel("Residual")
     plt.title("Residual Plot (Val)")
-    save_plot("results/residuals.png")
+    save_plot("results/vis_residual_plot.png")
 
     # ----------------------
     # 4. Residual histogram
@@ -194,7 +194,7 @@ def visualize_results(history, model, x_train, y_train, x_dev, y_dev):
     plt.xlabel("Residual (log10 cP)")
     plt.ylabel("Count")
     plt.title("Residual Histogram")
-    save_plot("results/residual_hist.png")
+    save_plot("results/vis_residual_hist.png")
 
     # ----------------------
     # 5. Distribution comparison
@@ -204,7 +204,7 @@ def visualize_results(history, model, x_train, y_train, x_dev, y_dev):
     plt.hist(y_pred_dev, bins=40, alpha=0.6, label="Predicted")
     plt.legend()
     plt.title("Distribution of True vs Predicted")
-    save_plot("results/dist_compare.png")
+    save_plot("results/vis_dist_compare.png")
 
     print("All figures saved in results/")
 
@@ -322,7 +322,7 @@ def main():
     ss_res = np.sum((y_dev - y_pred_dev)**2)
     R2 = 1 - ss_res / (ss_tot + EPS)
     mae = np.mean(np.abs(y_dev - y_pred_dev))
-    print(f"Dev R2: {R2:.4f}, MAE(log10 cP): {mae:.4f}")
+    print(f"Dis_Dev R2: {R2:.4f}, Dis_MAE(log10 cP): {mae:.4f}")
     visualize_results(history, model, x_train, y_train, x_dev, y_dev)
     
 
