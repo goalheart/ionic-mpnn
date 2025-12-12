@@ -1,0 +1,30 @@
+# Data files
+data/
+data copy/
+*.pkl
+*.keras
+*.h5
+*.pth
+*.pt
+*.npy
+*.npz
+*.csv
+*.jsonl
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs and outputs
+logs/
+results/
+outputs/
+models/          # 👈 除非你真想开源模型，否则忽略 models/
