@@ -140,7 +140,7 @@ def save_plot(path):
     plt.savefig(path, dpi=300, bbox_inches="tight")
     plt.close()
 
-def visualize_results(model, x_train, y_train, x_dev, y_dev):
+def visualize_results(history, model, x_train, y_train, x_dev, y_dev):
     print("Generating visualizations...")
 
     # predict
@@ -323,8 +323,8 @@ def main():
     R2 = 1 - ss_res / (ss_tot + EPS)
     mae = np.mean(np.abs(y_dev - y_pred_dev))
     print(f"Dev R2: {R2:.4f}, MAE(log10 cP): {mae:.4f}")
-    visualize_results(model, x_train, y_train, x_dev, y_dev)
-
+    visualize_results(history, model, x_train, y_train, x_dev, y_dev)
+    
 
 if __name__ == '__main__':
     main()
