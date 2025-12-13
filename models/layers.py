@@ -1,9 +1,10 @@
 # models/layers.py
 import tensorflow as tf
 from tensorflow.keras.layers import Layer, Dense, LayerNormalization
-from tensorflow.keras.utils import register_keras_serializable
+from keras.saving import register_keras_serializable
 import tensorflow.keras.backend as K
 
+@register_keras_serializable()
 class Reduce(Layer):
     """
     Aggregate messages to target atoms, ignoring tgt_idx == 0 (padding).
@@ -49,6 +50,9 @@ class Reduce(Layer):
     def compute_output_shape(self, input_shape):
         _, _, ref_shape = input_shape
         return ref_shape
+    
+    def get_config(self):
+        return super().get_config()
     
 @register_keras_serializable()
 class BondMatrixMessage(Layer):
@@ -104,6 +108,7 @@ class BondMatrixMessage(Layer):
         cfg.update({"atom_dim": self.atom_dim, "bond_dim": self.bond_dim})
         return cfg
 
+@register_keras_serializable()
 class GatedUpdate(Layer):
     """
     Node update with gating similar to GRU but implemented in dense ops for efficiency.
@@ -149,6 +154,7 @@ class GatedUpdate(Layer):
         cfg.update({"atom_dim": self.atom_dim, "dropout_rate": self.dropout_rate})
         return cfg
 
+@register_keras_serializable()
 class GlobalSumPool(Layer):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -161,3 +167,5 @@ class GlobalSumPool(Layer):
             return tf.reduce_sum(atom_features * mask, axis=1)
         else:
             return tf.reduce_sum(inputs, axis=1)
+    def get_config(self):
+        return super().get_config()

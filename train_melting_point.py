@@ -1,259 +1,290 @@
-# train_mp_from_pkl.py
-# 训练熔点预测模型：基于离子对 SMILES 预测熔点（K）
-# 依据论文 "Predicting Ionic Liquid Materials Properties from Chemical Structure"
+# ============================================================
+# Melting point prediction – TRANSFER LEARNING FROM VISCOSITY
+# Figure 2(c) in paper – Modified with temperature input (Scheme A)
+# ============================================================
+
 import os
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+
 import pickle
 import numpy as np
-import tensorflow as tf
-from tensorflow.keras.layers import Input, Embedding, Dense, Dropout, Lambda
-from tensorflow.keras.models import Model
-from tensorflow.keras.callbacks import EarlyStopping, LearningRateScheduler
-from tensorflow.keras.regularizers import l2
-from sklearn.model_selection import train_test_split
-from models.layers import BondMatrixMessage, GatedUpdate, GlobalSumPool, Reduce
 import matplotlib.pyplot as plt
+import tensorflow as tf
+import keras
+from tensorflow.keras.layers import Dense, Dropout, Input, Concatenate
+from tensorflow.keras.models import Model
+from tensorflow.keras.callbacks import EarlyStopping
+from sklearn.model_selection import train_test_split
+
+from models.layers import (
+    BondMatrixMessage, GatedUpdate, GlobalSumPool, Reduce
+)
 
 EPS = 1e-6
 
+# ============================================================
+# Utils
+# ============================================================
+
 def r2_numpy(y_true, y_pred):
-    ss_res = np.sum((y_true - y_pred)**2)
-    ss_tot = np.sum((y_true - np.mean(y_true))**2)
+    ss_res = np.sum((y_true - y_pred) ** 2)
+    ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
     return 1.0 - ss_res / (ss_tot + EPS)
 
-def pad_sequences_1d(seq_list, max_len=None, pad_val=0):
-    if max_len is None:
-        max_len = max(len(s) for s in seq_list)
-    padded = [s + [pad_val] * (max_len - len(s)) for s in seq_list]
-    return np.array(padded, dtype=np.int32)
+def pad_sequences_1d(seq_list, max_len, pad_val=0):
+    return np.array(
+        [s + [pad_val] * (max_len - len(s)) for s in seq_list],
+        dtype=np.int32
+    )
 
-def preprocess_edges_and_bonds(edge_list, bond_list, max_edges=None):
-    processed_edges = []
-    processed_bonds = []
+def preprocess_edges_and_bonds(edge_list, bond_list, max_edges):
+    edges_out, bonds_out = [], []
+
     for edges, bonds in zip(edge_list, bond_list):
-        directed_edges = []
-        directed_bonds = []
-        for (src, tgt), bond_id in zip(edges, bonds):
-            directed_edges.append([src, tgt])
-            directed_bonds.append(bond_id)
-            directed_edges.append([tgt, src])
-            directed_bonds.append(bond_id)
-        processed_edges.append(directed_edges)
-        processed_bonds.append(directed_bonds)
+        e2, b2 = [], []
+        for (src, tgt), bid in zip(edges, bonds):
+            e2.append([src, tgt])
+            b2.append(bid)
+            e2.append([tgt, src])
+            b2.append(bid)
+        edges_out.append(e2)
+        bonds_out.append(b2)
 
-    if max_edges is None:
-        max_len = max(len(e) for e in processed_edges)
-    else:
-        max_len = max_edges * 2
+    max_len = max_edges * 2
 
-    processed_edges = [e + [[0,0]] * (max_len - len(e)) if len(e) < max_len else e[:max_len] for e in processed_edges]
-    processed_bonds = [b + [0] * (max_len - len(b)) if len(b) < max_len else b[:max_len] for b in processed_bonds]
+    edges_out = [
+        e + [[0, 0]] * (max_len - len(e)) if len(e) < max_len else e[:max_len]
+        for e in edges_out
+    ]
+    bonds_out = [
+        b + [0] * (max_len - len(b)) if len(b) < max_len else b[:max_len]
+        for b in bonds_out
+    ]
 
-    return np.array(processed_edges, dtype=np.int32), np.array(processed_bonds, dtype=np.int32)
+    return (
+        np.array(edges_out, dtype=np.int32),
+        np.array(bonds_out, dtype=np.int32)
+    )
 
-def build_base_encoder(atom_vocab_size, bond_vocab_size,
-                       atom_dim=32, bond_dim=8, fp_size=32, mixing_size=20,
-                       num_steps=4, dropout_rate=0.2):
-    # Build inputs and shared embedding + message passing, but return the "combined" fingerprint tensor and inputs dict
-    cat_atom_in = Input(shape=(None,), dtype=tf.int32, name='cat_atom')
-    cat_bond_in = Input(shape=(None,), dtype=tf.int32, name='cat_bond')
-    cat_conn_in = Input(shape=(None, 2), dtype=tf.int32, name='cat_connectivity')
-
-    an_atom_in = Input(shape=(None,), dtype=tf.int32, name='an_atom')
-    an_bond_in = Input(shape=(None,), dtype=tf.int32, name='an_bond')
-    an_conn_in = Input(shape=(None, 2), dtype=tf.int32, name='an_connectivity')
-
-    atom_embedding = Embedding(atom_vocab_size, atom_dim, mask_zero=True, name='atom_embedding')
-    bond_embedding = Embedding(bond_vocab_size, bond_dim, mask_zero=True, name='bond_embedding')
-
-    # cation
-    cat_atom_emb = atom_embedding(cat_atom_in)
-    cat_bond_emb = bond_embedding(cat_bond_in)
-    atom_state = cat_atom_emb
-    for i in range(num_steps):
-        messages = BondMatrixMessage(atom_dim, bond_dim, name=f'cat_bmm_{i}')([atom_state, cat_bond_emb, cat_conn_in])
-        aggregated = Reduce(name=f'cat_reduce_{i}')([messages, cat_conn_in[:,:,1], atom_state])
-        atom_state = GatedUpdate(atom_dim, dropout_rate=dropout_rate, name=f'cat_update_{i}')([atom_state, aggregated])
-    fp_cat = GlobalSumPool()([atom_state, cat_atom_in])
-    fp_cat = Dense(fp_size, activation='relu', kernel_regularizer=l2(1e-5), name='fp_cat_dense')(fp_cat)
-    fp_cat = Dropout(dropout_rate, name='fp_cat_dropout')(fp_cat)
-
-    # anion
-    an_atom_emb = atom_embedding(an_atom_in)
-    an_bond_emb = bond_embedding(an_bond_in)
-    atom_state = an_atom_emb
-    for i in range(num_steps):
-        messages = BondMatrixMessage(atom_dim, bond_dim, name=f'an_bmm_{i}')([atom_state, an_bond_emb, an_conn_in])
-        aggregated = Reduce(name=f'an_reduce_{i}')([messages, an_conn_in[:,:,1], atom_state])
-        atom_state = GatedUpdate(atom_dim, dropout_rate=dropout_rate, name=f'an_update_{i}')([atom_state, aggregated])
-    fp_an = GlobalSumPool()([atom_state, an_atom_in])
-    fp_an = Dense(fp_size, activation='relu', kernel_regularizer=l2(1e-5), name='fp_an_dense')(fp_an)
-    fp_an = Dropout(dropout_rate, name='fp_an_dropout')(fp_an)
-
-    cat_proj = Dense(mixing_size, activation='relu', name='cat_proj')(fp_cat)
-    an_proj = Dense(mixing_size, activation='relu', name='an_proj')(fp_an)
-    combined = Lambda(lambda x: x[0] + x[1], name='combine')([cat_proj, an_proj])
-
-    inputs = {
-        'cat_atom': cat_atom_in, 'cat_bond': cat_bond_in, 'cat_connectivity': cat_conn_in,
-        'an_atom': an_atom_in, 'an_bond': an_bond_in, 'an_connectivity': an_conn_in
-    }
-    return inputs, combined
-
-def build_melting_model(atom_vocab_size, bond_vocab_size,
-                        atom_dim=32, bond_dim=8, fp_size=32, mixing_size=20,
-                        num_steps=4, dropout_rate=0.2):
-    inputs, combined = build_base_encoder(atom_vocab_size, bond_vocab_size,
-                                          atom_dim, bond_dim, fp_size, mixing_size, num_steps, dropout_rate)
-    # melting head: single output (paper scaled between -1 and 1; here assume y already scaled)
-    out = Dense(1, name='melting_out')(combined)
-    model = Model(inputs=list(inputs.values()), outputs=out)
-    opt = tf.keras.optimizers.Adam(learning_rate=3e-4)
-    def r2_metric_tf(y_true, y_pred):
-        ss_res = tf.reduce_sum(tf.square(y_true - y_pred))
-        ss_tot = tf.reduce_sum(tf.square(y_true - tf.reduce_mean(y_true)))
-        return 1 - ss_res / (ss_tot + EPS)
-    model.compile(optimizer=opt, loss='mse', metrics=[r2_metric_tf])
-    return model
-
-def save_plot(path):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    plt.savefig(path, dpi=300, bbox_inches="tight")
-    plt.close()
-
-def visualize_pred_vs_true_simple(y_train, y_pred_train, y_dev, y_pred_dev, outpath, title='Melting: Pred vs True'):
-    plt.figure(figsize=(6,6))
-    plt.scatter(y_train, y_pred_train, s=8, alpha=0.3, label='Train')
-    plt.scatter(y_dev, y_pred_dev, s=15, alpha=0.6, label='Dev')
-    low = min(np.min(y_train), np.min(y_dev))
-    high = max(np.max(y_train), np.max(y_dev))
-    plt.plot([low, high], [low, high], 'k--')
-    plt.xlabel("True (scaled)")
-    plt.ylabel("Predicted (scaled)")
-    plt.legend()
-    plt.title(title)
-    save_plot(outpath)
+# ============================================================
+# Main
+# ============================================================
 
 def main():
-    DATA_MP = 'data/melting_point_id_data.pkl'  # assumed structure similar: rec['pair_id'], rec['cation'], rec['anion'], rec['melting_scaled']
-    VOCAB = 'data/vocab.pkl'
+    # --------------------------------------------------------
+    # Load data
+    # --------------------------------------------------------
+    DATA = "data/melting_point_id_data.pkl"
+    VOCAB = "data/vocab.pkl"
+    VISC_MODEL_PATH = "models/viscosity_final.keras"
 
-    with open(DATA_MP, 'rb') as f:
+    with open(DATA, "rb") as f:
         data = pickle.load(f)
-    with open(VOCAB, 'rb') as f:
+    with open(VOCAB, "rb") as f:
         vocab = pickle.load(f)
 
-    atom_vocab_size = vocab['atom_vocab_size']
-    bond_vocab_size = vocab['bond_vocab_size']
+    atom_vocab_size = vocab["atom_vocab_size"] + 1
+    bond_vocab_size = vocab["bond_vocab_size"] + 1
 
-    pair_ids = [rec['pair_id'] for rec in data]
-    cat_atom_ids = [rec['cation']['atom_ids'] for rec in data]
-    cat_bond_ids = [rec['cation']['bond_ids'] for rec in data]
-    cat_edges    = [rec['cation']['edge_indices'] for rec in data]
-    an_atom_ids  = [rec['anion']['atom_ids'] for rec in data]
-    an_bond_ids  = [rec['anion']['bond_ids'] for rec in data]
-    an_edges     = [rec['anion']['edge_indices'] for rec in data]
+    pair_ids = [d["pair_id"] for d in data]
 
-    # assume melting values are pre-scaled to -1..1 as paper mentions; if not, scale here
-    # labels = np.array([rec['melting_scaled'] for rec in mp_data], dtype=np.float32).reshape(-1,1)
-    # 先提取原始熔点
-    raw_mps = np.array([rec['mp'] for rec in data], dtype=np.float32)
-    # 可选：进行归一化（例如 Min-Max 或 StandardScaler）
-    # 这里以简单的减均值除标准差为例（也可以改用 MinMaxScaler）
-    mean_mp = raw_mps.mean()
-    std_mp = raw_mps.std() + 1e-8  # 防止除零
-    scaled_mps = (raw_mps - mean_mp) / std_mp
-    labels = scaled_mps.reshape(-1, 1)
+    cat_atoms = [[a + 1 for a in d["cation"]["atom_ids"]] for d in data]
+    cat_bonds = [[b + 1 for b in d["cation"]["bond_ids"]] for d in data]
+    cat_edges = [d["cation"]["edge_indices"] for d in data]
 
-    unique_pairs = list(dict.fromkeys(pair_ids))
-    train_pairs, dev_pairs = train_test_split(unique_pairs, test_size=0.2, random_state=42)
-    train_mask = np.array([pid in train_pairs for pid in pair_ids])
-    dev_mask = np.array([pid in dev_pairs for pid in pair_ids])
+    an_atoms  = [[a + 1 for a in d["anion"]["atom_ids"]] for d in data]
+    an_bonds  = [[b + 1 for b in d["anion"]["bond_ids"]] for d in data]
+    an_edges  = [d["anion"]["edge_indices"] for d in data]
 
-    max_atoms = max(max(len(x) for x in cat_atom_ids), max(len(x) for x in an_atom_ids))
-    max_edges = max(max(len(x) for x in cat_edges),    max(len(x) for x in an_edges))
+    # --------------------------------------------------------
+    # Target: melting point (z-score, PAPER)
+    # --------------------------------------------------------
+    raw_mp = np.array([d["mp"] for d in data], dtype=np.float32)
+    mp_mean = raw_mp.mean()
+    mp_std  = raw_mp.std() + 1e-6
 
-    cat_atom_train = pad_sequences_1d([cat_atom_ids[i] for i in range(len(cat_atom_ids)) if train_mask[i]], max_atoms, pad_val=0)
-    cat_edge_train, cat_bond_train = preprocess_edges_and_bonds(
-        [cat_edges[i] for i in range(len(cat_edges)) if train_mask[i]],
-        [cat_bond_ids[i] for i in range(len(cat_bond_ids)) if train_mask[i]],
-        max_edges
+    y = (raw_mp - mp_mean) / mp_std
+    y = y.reshape(-1, 1)
+
+    indices = np.arange(len(data))
+
+    # --------------------------------------------------------
+    # SPLIT (paper default: sample-level)
+    # --------------------------------------------------------
+    idx_train, idx_tmp = train_test_split(
+        indices, test_size=0.30, random_state=42
     )
-    an_atom_train = pad_sequences_1d([an_atom_ids[i] for i in range(len(an_atom_ids)) if train_mask[i]], max_atoms, pad_val=0)
-    an_edge_train, an_bond_train = preprocess_edges_and_bonds(
-        [an_edges[i] for i in range(len(an_edges)) if train_mask[i]],
-        [an_bond_ids[i] for i in range(len(an_bond_ids)) if train_mask[i]],
-        max_edges
+    idx_dev, idx_test = train_test_split(
+        idx_tmp, test_size=0.50, random_state=42
     )
-    y_train = labels[train_mask]
 
-    cat_atom_dev = pad_sequences_1d([cat_atom_ids[i] for i in range(len(cat_atom_ids)) if dev_mask[i]], max_atoms, pad_val=0)
-    cat_edge_dev, cat_bond_dev = preprocess_edges_and_bonds(
-        [cat_edges[i] for i in range(len(cat_edges)) if dev_mask[i]],
-        [cat_bond_ids[i] for i in range(len(cat_bond_ids)) if dev_mask[i]],
-        max_edges
+    # --------------------------------------------------------
+    # Padding
+    # --------------------------------------------------------
+    max_atoms = max(max(map(len, cat_atoms)), max(map(len, an_atoms)))
+    max_edges = max(max(map(len, cat_edges)), max(map(len, an_edges)))
+
+    def build_inputs(idxs):
+        ce, cb = preprocess_edges_and_bonds(
+            [cat_edges[i] for i in idxs],
+            [cat_bonds[i] for i in idxs],
+            max_edges
+        )
+        ae, ab = preprocess_edges_and_bonds(
+            [an_edges[i] for i in idxs],
+            [an_bonds[i] for i in idxs],
+            max_edges
+        )
+        # Use dummy temperature = 0 (as in original model)
+        temperature = np.zeros((len(idxs), 1), dtype=np.float32)
+        return {
+            "cat_atom": pad_sequences_1d([cat_atoms[i] for i in idxs], max_atoms),
+            "cat_bond": cb,
+            "cat_connectivity": ce,
+            "an_atom": pad_sequences_1d([an_atoms[i] for i in idxs], max_atoms),
+            "an_bond": ab,
+            "an_connectivity": ae,
+            "temperature": temperature,  # ✅ Now included as input
+        }
+
+    x_train = build_inputs(idx_train)
+    x_dev   = build_inputs(idx_dev)
+    x_test  = build_inputs(idx_test)
+
+    y_train = y[idx_train]
+    y_dev   = y[idx_dev]
+    y_test  = y[idx_test]
+
+    # ========================================================
+    # Load viscosity model & extract base feature
+    # ========================================================
+    visc_model = keras.models.load_model(
+        VISC_MODEL_PATH,
+        compile=False
     )
-    an_atom_dev = pad_sequences_1d([an_atom_ids[i] for i in range(len(an_atom_ids)) if dev_mask[i]], max_atoms, pad_val=0)
-    an_edge_dev, an_bond_dev = preprocess_edges_and_bonds(
-        [an_edges[i] for i in range(len(an_edges)) if dev_mask[i]],
-        [an_bond_ids[i] for i in range(len(an_bond_ids)) if dev_mask[i]],
-        max_edges
+
+    # Extract output before the final viscosity head (assumed to be layer[-4])
+    mixed_output = visc_model.layers[-4].output
+
+    base_model = Model(
+        inputs=visc_model.inputs,
+        outputs=mixed_output,
+        name="frozen_viscosity_base"
     )
-    y_dev = labels[dev_mask]
 
-    print(f"Melting Train / Dev sizes: {len(y_train)} / {len(y_dev)}")
+    # Freeze base model
+    for layer in base_model.layers:
+        layer.trainable = False
 
-    model = build_melting_model(atom_vocab_size+1, bond_vocab_size+1,
-                                atom_dim=32, bond_dim=8, fp_size=32, mixing_size=20, num_steps=4, dropout_rate=0.2)
+    # Get reference to temperature input from base model
+    # NOTE: viscosity model must have included 'temperature' as an input!
+    temperature_input = None
+    for inp in base_model.inputs:
+        if inp.name.startswith('temperature'):
+            temperature_input = inp
+            break
+    if temperature_input is None:
+        raise ValueError("Viscosity model does not contain 'temperature' input. "
+                         "Please ensure the original model was trained with temperature.")
+
+    # ========================================================
+    # Build new melting point head WITH temperature
+    # ========================================================
+    # Feature from frozen base
+    ion_feature = base_model.output
+
+    # New dense layer on top
+    x = Dense(256, activation="relu", name="mp_dense_1")(ion_feature)
+    x = Dropout(0.2, name="mp_dropout")(x)
+
+    # 🔥 Concatenate temperature
+    x = Concatenate(name="concat_temp")([x, temperature_input])
+
+    # Final prediction
+    mp_out = Dense(1, name="melting_out")(x)
+
+    model = Model(
+        inputs=base_model.inputs,  # includes temperature
+        outputs=mp_out,
+        name="melting_transfer"
+    )
+
+    model.compile(
+        optimizer=keras.optimizers.Adam(1e-3),
+        loss="mse"
+    )
+
     model.summary()
 
-    def lr_schedule(epoch, lr):
-        if epoch > 0 and epoch % 200 == 0:
-            return lr * 0.5
-        return lr
-    lr_callback = LearningRateScheduler(lr_schedule)
-    early_stop = EarlyStopping(monitor='val_loss', patience=50, restore_best_weights=True, min_delta=1e-5)
-
-    x_train = {
-        'cat_atom': cat_atom_train,
-        'cat_bond': cat_bond_train,
-        'cat_connectivity': cat_edge_train,
-        'an_atom': an_atom_train,
-        'an_bond': an_bond_train,
-        'an_connectivity': an_edge_train
-    }
-    x_dev = {
-        'cat_atom': cat_atom_dev,
-        'cat_bond': cat_bond_dev,
-        'cat_connectivity': cat_edge_dev,
-        'an_atom': an_atom_dev,
-        'an_bond': an_bond_dev,
-        'an_connectivity': an_edge_dev
-    }
-
+    # ========================================================
+    # Train
+    # ========================================================
     history = model.fit(
         x_train, y_train,
         validation_data=(x_dev, y_dev),
         epochs=1000,
         batch_size=32,
-        callbacks=[lr_callback, early_stop],
+        callbacks=[
+            EarlyStopping(monitor="val_loss", patience=50, restore_best_weights=True)
+        ],
         verbose=1
     )
 
-    os.makedirs('models', exist_ok=True)
-    model.save('models/mp_final.keras')
-    print("Saved melting model to models/melting_point_final.keras")
+    # ========================================================
+    # Evaluation (paper format)
+    # ========================================================
+    def eval_split(name, x_, y_):
+        pred = model.predict(x_).flatten()
+        y_true = y_.flatten() * mp_std + mp_mean
+        y_pred = pred * mp_std + mp_mean
+        print(
+            f"{name}: R2={r2_numpy(y_true, y_pred):.4f}, "
+            f"MAE={np.mean(np.abs(y_true - y_pred)):.4f}"
+        )
+        return y_true, y_pred
 
-    y_pred_train = model.predict(x_train, batch_size=32).flatten()
-    y_pred_dev = model.predict(x_dev, batch_size=32).flatten()
-    R2_train = r2_numpy(y_train.flatten(), y_pred_train)
-    R2_dev = r2_numpy(y_dev.flatten(), y_pred_dev)
-    mae_train = np.mean(np.abs(y_train.flatten() - y_pred_train))
-    mae_dev   = np.mean(np.abs(y_dev.flatten() - y_pred_dev))
-    print(f"Melting R2_train: {R2_train:.4f}, MAE_train: {mae_train:.4f}")
-    print(f"Melting R2_dev:   {R2_dev:.4f}, MAE_dev:   {mae_dev:.4f}")
+    ytr_true, ytr_pred = eval_split("Train", x_train, y_train)
+    ydv_true, ydv_pred = eval_split("Dev",   x_dev,   y_dev)
+    yts_true, yts_pred = eval_split("Test",  x_test,  y_test)
 
-    visualize_pred_vs_true_simple(y_train.flatten(), y_pred_train, y_dev.flatten(), y_pred_dev, 'results/figure2_b_melting_point.png')
+    # ========================================================
+    # Figure 2(c) – Transfer learning parity plot
+    # ========================================================
+    plt.figure(figsize=(5, 5))
 
-if __name__ == '__main__':
+    plt.scatter(
+        ytr_true,
+        ytr_pred,
+        s=10,
+        alpha=0.6,
+        color="#2E7D32",
+        label="Train"
+    )
+
+    plt.scatter(
+        ydv_true,
+        ydv_pred,
+        s=18,
+        alpha=0.6,
+        color="#A5D6A7",
+        label="Validation"
+    )
+
+    low = min(ytr_true.min(), ydv_true.min(), ytr_pred.min(), ydv_pred.min())
+    high = max(ytr_true.max(), ydv_true.max(), ytr_pred.max(), ydv_pred.max())
+    plt.plot([low, high], [low, high], "k--", linewidth=1)
+
+    plt.xlabel("Experimental melting point (K)")
+    plt.ylabel("Predicted melting point (K)")
+    plt.title("Melting point prediction (transfer learning)")
+
+    plt.legend(frameon=False)
+    plt.tight_layout()
+    plt.savefig("./results/figure2_c_melting_point_transfer.png", dpi=300)
+    plt.close()
+
+    print("Saved Figure 2(c): ./results/figure2_c_melting_point_transfer.png")
+
+# ============================================================
+if __name__ == "__main__":
     main()
