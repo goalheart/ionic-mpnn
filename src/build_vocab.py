@@ -1,7 +1,18 @@
 # src/build_vocab.py
+"""
+1. 代码加载了两个 Pickle 文件：data/viscosity_graph_data.pkl（粘度相关的图数据）和 data/mp_graph_data.pkl（熔点相关的图数据）。
+
+2. 最终生成的 vocab.pkl 文件是一个包含以下键的字典：
+    'atom_vocab'： {原子特征元组: 整数ID}
+    'bond_vocab'： {化学键特征元组: 整数ID}
+    'atom_vocab_size'： 唯一原子特征的数量（词汇表大小）
+    'bond_vocab_size'： 唯一化学键特征的数量（词汇表大小）
+
+3. 目的分子的图结构数据转换为 GNN 的模型输入
+"""
+
 import pickle
 from pathlib import Path
-
 def build_vocab_from_graph_data(vis_file='data/viscosity_graph_data.pkl',
                                 mp_file='data/mp_graph_data.pkl'):
     """

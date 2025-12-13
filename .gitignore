@@ -1,6 +1,6 @@
 # Data files
 data/
-data copy/
+
 *.pkl
 *.keras
 *.h5
