@@ -1,3 +1,7 @@
+import os 
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"  # 2 = INFO, WARNING 都不显示
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"        # 可选：关闭 oneDNN
+os.environ["ABSL_LOG_LEVEL"] = "2"               # ← 关键！3 = ERROR 及以上，2 = WARNING 及以上
 # train_melting_point.py
 """
 独立训练离子液体熔点 (Melting Point) 预测模型。
@@ -10,9 +14,32 @@ from tensorflow import keras
 from tensorflow.keras import layers
 import numpy as np
 import pickle
-import os 
 from pathlib import Path
 import matplotlib.pyplot as plt
+
+# --- 自定义回调：仅在指定 epoch 输出日志 ---
+class SelectiveVerboseCallback(keras.callbacks.Callback):
+    def __init__(self, total_epochs, verbose_epochs=None):
+        super().__init__()
+        self.total_epochs = total_epochs
+        if verbose_epochs is None:
+            base = [1, 2, 3, 4, 5, 50, 100, 150, 200]
+            last_five = list(range(total_epochs - 4, total_epochs + 1))
+            self.verbose_epochs = set(base + last_five)
+        else:
+            self.verbose_epochs = set(verbose_epochs)
+
+    def on_epoch_end(self, epoch, logs=None):
+        current_epoch = epoch + 1  # epoch 是 0-indexed
+        if current_epoch in self.verbose_epochs:
+            loss = logs.get('loss', 0)
+            val_loss = logs.get('val_loss', 0)
+            r2 = logs.get('r2_score', None)
+            val_r2 = logs.get('val_r2_score', None)
+            msg = f"Epoch {current_epoch}/{self.total_epochs} - loss: {loss:.6f} - val_loss: {val_loss:.6f}"
+            if r2 is not None:
+                msg += f" - r2: {r2:.4f} - val_r2: {val_r2:.4f}"
+            print(msg)
 
 # --- 1. 辅助函数 ---
 
@@ -90,7 +117,6 @@ class MessagePassingLayer(layers.Layer):
 
         # GRUCell 更新：
         # GRUCell 返回 [new_output, new_state]，我们只需要 new_output/state (即第一个元素)
-        # FIX: 使用 cell(inputs, states)[0] 取出新的状态
         h_new_flat = self.gru(m_flat, [h_flat])[0] 
 
         # reshape 回原来的 shape
@@ -405,15 +431,17 @@ def train_model():
     print("\n" + "="*50)
     print("--- 熔点模型训练开始 (Loss 在标准化尺度上) ---")
     
+    total_epochs = HYPERPARAMS['epochs']
     history = model.fit(
         X_train, Y_train_s, # 使用标准化的 Y 进行训练
         validation_data=(X_dev, Y_dev_s),
-        epochs=HYPERPARAMS['epochs'],
+        epochs=total_epochs,
         batch_size=HYPERPARAMS['batch_size'],
         callbacks=[
             keras.callbacks.EarlyStopping(patience=50, monitor='val_loss', restore_best_weights=True),
+            SelectiveVerboseCallback(total_epochs=total_epochs)
         ],
-        verbose=1
+        verbose=0  # 关闭默认日志
     )
     
     # ========================================================

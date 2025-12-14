@@ -83,6 +83,25 @@ def preprocess_edges_and_bonds(edge_list, bond_list, max_edges):
         np.array(processed_bonds, dtype=np.int32)
     )
 
+class SelectiveVerboseCallback(keras.callbacks.Callback):
+    def __init__(self, total_epochs, verbose_epochs=None):
+        super().__init__()
+        self.total_epochs = total_epochs
+        if verbose_epochs is None:
+            # 默认：1~5, 50, 100, 150, 200, 最后5个
+            base = [1, 2, 3, 4, 5, 50, 100, 150, 200]
+            last_five = list(range(total_epochs - 4, total_epochs + 1))
+            self.verbose_epochs = set(base + last_five)
+        else:
+            self.verbose_epochs = set(verbose_epochs)
+
+    def on_epoch_end(self, epoch, logs=None):
+        current_epoch = epoch + 1  # epoch is 0-indexed
+        if current_epoch in self.verbose_epochs:
+            loss = logs.get('loss', 0)
+            val_loss = logs.get('val_loss', 0)
+            print(f"Epoch {current_epoch}/{self.total_epochs} - loss: {loss:.6f} - val_loss: {val_loss:.6f}")
+
 # ============================================================
 # Viscosity head (PHYSICALLY CONSTRAINED)
 # log_eta = A + B / (T + C)
@@ -138,8 +157,8 @@ def build_model(
     T_input = Input(shape=(1,), dtype=tf.float32, name="temperature")
 
     # ---------- Embeddings ----------
-    atom_emb_layer = Embedding(atom_vocab_size, atom_dim, mask_zero=True)
-    bond_emb_layer = Embedding(bond_vocab_size, bond_dim, mask_zero=True)
+    atom_emb_layer = Embedding(atom_vocab_size, atom_dim, mask_zero=False)
+    bond_emb_layer = Embedding(bond_vocab_size, bond_dim, mask_zero=False)
 
     def encode(atom_ids, bond_ids, conn, prefix):
         atom_emb = atom_emb_layer(atom_ids)
@@ -268,15 +287,17 @@ def main():
 
     model = build_model(atom_vocab_size, bond_vocab_size)
 
+    total_epochs = 1000
     history = model.fit(
         x_train, y_train,
         validation_data=(x_dev, y_dev),
-        epochs=1000,
+        epochs=total_epochs,
         batch_size=32,
         callbacks=[
-            EarlyStopping(monitor="val_loss", patience=50, restore_best_weights=True)
+            EarlyStopping(monitor="val_loss", patience=50, restore_best_weights=True),
+            SelectiveVerboseCallback(total_epochs=total_epochs)
         ],
-        verbose=1
+        verbose=0  # 关闭默认日志
     )
     # ========================================================
     # Save final viscosity model (for transfer learning)
