@@ -1,8 +1,50 @@
 # models/layers.py
 import tensorflow as tf
+import keras
 from tensorflow.keras.layers import Layer, Dense, LayerNormalization
 from keras.saving import register_keras_serializable
 import tensorflow.keras.backend as K
+from keras import layers
+
+# ============================================================
+# 粘度预测头（物理约束形式）
+# log(η) = A + B / (T + C)  —— Arrhenius-like 方程
+# ============================================================
+@keras.saving.register_keras_serializable()
+class ComputeLogEta(layers.Layer):
+    def call(self, inputs):
+        A, B, T, C = inputs
+        return A + B / (T + C + 1e-6)
+
+@keras.saving.register_keras_serializable()
+class ScaleTemperature(layers.Layer):
+    def call(self, t):
+        return t / 100.0
+
+@keras.saving.register_keras_serializable()
+class SliceParamA(layers.Layer):
+    def call(self, x):
+        return x[:, 0:1]
+
+@keras.saving.register_keras_serializable()
+class SliceParamB(layers.Layer):
+    def call(self, x):
+        b = x[:, 1:2]
+        b = keras.ops.nn.softplus(b)
+        return keras.ops.clip(b, 0.0, 20.0)
+
+@keras.saving.register_keras_serializable()
+class SliceParamC(layers.Layer):
+    def call(self, x):
+        c = x[:, 2:3]
+        c = keras.ops.nn.softplus(c)
+        return keras.ops.clip(c, 0.1, 50.0)
+
+@keras.saving.register_keras_serializable()
+class AddTwoTensors(layers.Layer):
+    def call(self, inputs):
+        a, b = inputs
+        return a + b
 
 @register_keras_serializable()
 class Reduce(Layer):
@@ -169,3 +211,22 @@ class GlobalSumPool(Layer):
             return tf.reduce_sum(inputs, axis=1)
     def get_config(self):
         return super().get_config()
+    
+@keras.saving.register_keras_serializable()
+class GatherNeighborFeatureLayer(layers.Layer):
+    """
+    提取邻居节点特征 h_w（tf.gather 封装）
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+    def call(self, inputs):
+        h_v, edge_input = inputs
+        target_indices = edge_input[:, :, 1]
+        h_w = tf.gather(h_v, target_indices, batch_dims=1)
+        return h_w
+
+    def get_config(self):
+        config = super().get_config()
+        return config
