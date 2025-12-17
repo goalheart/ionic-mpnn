@@ -1,6 +1,5 @@
 # train_melting_point.py
 # 训练熔点（Melting Point, MP）预测模型：基于离子对 SMILES 预测熔点
-# 项目结构适配：使用 pathlib 管理路径，与 viscosity 训练脚本对齐
 # ============================================================
 
 import os
@@ -310,13 +309,14 @@ def main():
     # ========================================================
     os.makedirs("results", exist_ok=True)
 
-    with open("./results/loss_melting_point.pkl", "wb") as f:
+    with open("./results/history_melting_point.pkl", "wb") as f:
         pickle.dump(history.history, f)
 
-    print("Saved training history to results/loss_melting_point.pkl")
+    print("Saved training history to results/history_melting_point.pkl")
 
     # 保存模型（Keras v3 格式）
     model.save(MODELS_DIR / "melting_point_final.keras", save_format="keras_v3")
+    
     # 保存损失曲线
     plot_loss(history, RESULTS_DIR / "loss_melting_point.png")
 

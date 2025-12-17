@@ -25,6 +25,7 @@ from tensorflow.keras.models import Model
 from tensorflow.keras.callbacks import EarlyStopping
 from tensorflow.keras.regularizers import l2
 from sklearn.model_selection import train_test_split
+from pathlib import Path
 
 # 导入自定义图神经网络层
 from models.layers import (
@@ -39,6 +40,9 @@ from models.layers import (
     ScaleTemperature,
     ComputeLogEta
 )
+
+BASE_DIR = Path(__file__).parent.parent        # 项目根目录
+MODELS_DIR = BASE_DIR / "models" 
 
 # 从粘度训练脚本中复用工具函数和构建逻辑（保持一致性）
 from train_viscosity import (
@@ -220,6 +224,8 @@ def main():
         loss=tf.keras.losses.MeanSquaredError(), # 熔点预测是回归任务，通常使用 MSE
         metrics=[tf.keras.metrics.RootMeanSquaredError(name='rmse')]
     )
+    # 保存模型（Keras v3 格式）
+    model.save(MODELS_DIR / "melting_point_transferfinal.keras", save_format="keras_v3")
 
     total_epochs = 1000
     history = model.fit(
@@ -239,10 +245,10 @@ def main():
     # ========================================================
     os.makedirs("results", exist_ok=True)
 
-    with open("./results/loss_melting_point_transfer.pkl", "wb") as f:
+    with open("./results/history_melting_point_transfer.pkl", "wb") as f:
         pickle.dump(history.history, f)
 
-    print("Saved training history to results/loss_melting_point_transfer.pkl")
+    print("Saved training history to results/history_melting_point_transfer.pkl")
 
     # 保存损失曲线
     plot_loss(history, "./results/loss_melting_point_transfer.png")
