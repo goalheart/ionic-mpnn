@@ -14,7 +14,7 @@ import pickle
 import numpy as np
 import matplotlib.pyplot as plt
 import tensorflow as tf
-import keras
+from tensorflow import keras
 from tensorflow.keras.layers import Input, Embedding, Dense, Add
 from tensorflow.keras.models import Model
 from tensorflow.keras.callbacks import EarlyStopping
@@ -32,10 +32,10 @@ EPS = 1e-6
 # 路径配置（使用 pathlib 确保跨平台兼容性）
 # ============================================================
 
-BASE_DIR = Path(__file__).parent.parent        # 项目根目录
-DATA_DIR = BASE_DIR / "ionic-mpnn/data"        # 数据目录
-RESULTS_DIR = BASE_DIR / "ionic-mpnn/results"  # 结果输出目录
-MODELS_DIR = BASE_DIR / "models"               # 模型保存目录
+BASE_DIR = Path(__file__).parent               # 项目根目录
+DATA_DIR = BASE_DIR / "data"        # 数据目录
+RESULTS_DIR = BASE_DIR / "results"  # 结果输出目录
+MODELS_DIR = BASE_DIR / "models"    # 模型保存目录
 
 MP_DATA_PATH = DATA_DIR / "mp_id_data.pkl"     # 熔点数据路径
 VOCAB_PATH = DATA_DIR / "vocab.pkl"            # 原子/键词表路径
@@ -314,8 +314,8 @@ def main():
 
     print("Saved training history to results/history_melting_point.pkl")
 
-    # 保存模型（Keras v3 格式）
-    model.save(MODELS_DIR / "melting_point_final.keras", save_format="keras_v3")
+    # 保存模型
+    model.save(MODELS_DIR / "melting_point_final.keras")
     
     # 保存损失曲线
     plot_loss(history, RESULTS_DIR / "loss_melting_point.png")

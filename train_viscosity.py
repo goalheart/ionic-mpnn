@@ -13,7 +13,7 @@ import pickle
 import numpy as np
 import matplotlib.pyplot as plt
 import tensorflow as tf
-import keras
+from tensorflow import keras
 from tensorflow.keras.layers import Input, Embedding, Dense
 from tensorflow.keras.models import Model
 from tensorflow.keras.callbacks import EarlyStopping
@@ -351,7 +351,7 @@ def main():
     # 保存最终粘度模型（可用于迁移学习）
     # ========================================================
     os.makedirs("models", exist_ok=True)
-    model.save("models/viscosity_final.keras", save_format="keras_v3")
+    model.save("models/viscosity_final.keras")
     print("Saved viscosity model to models/viscosity_final.keras")
 
     # 绘制并保存损失曲线
