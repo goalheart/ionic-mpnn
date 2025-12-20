@@ -1,6 +1,6 @@
 # ============================================================
 # train_melting_point_transfer.py
-# 使用迁移学习（Transfer Learning）预测离子液体熔点
+# Transfer learning for ionic liquid melting point prediction
 # ============================================================
 
 import os
@@ -31,7 +31,7 @@ flags.DEFINE_float("lr_stage1", 1e-3, "LR for head training")
 flags.DEFINE_float("lr_stage2", 1e-4, "LR for fine-tuning")
 
 # ============================================================
-# 自定义 GNN 层（必须与粘度模型一致）
+# 自定义层
 # ============================================================
 
 from models.layers import (
@@ -48,7 +48,7 @@ from models.layers import (
 )
 
 # ============================================================
-# 工具函数（与 train_viscosity.py 保持一致）
+# 工具函数
 # ============================================================
 
 from train_viscosity import (
@@ -70,10 +70,10 @@ RESULTS_DIR.mkdir(exist_ok=True)
 EPS = 1e-6
 
 # ============================================================
-# 构建迁移学习模型
+# 构建迁移学习模型（不训练）
 # ============================================================
 
-def build_transfer_model(viscosity_model_path, freeze_base=True):
+def build_transfer_model(viscosity_model_path):
 
     base_model = tf.keras.models.load_model(
         viscosity_model_path,
@@ -103,12 +103,6 @@ def build_transfer_model(viscosity_model_path, freeze_base=True):
     output = Dense(1, name="melting_point")(x)
 
     model = Model(inputs=inputs, outputs=output)
-
-    if freeze_base:
-        for layer in model.layers:
-            if not layer.name.startswith("mp_") and layer.name != "melting_point":
-                layer.trainable = False
-
     return model
 
 # ============================================================
@@ -139,8 +133,6 @@ def main():
     idx = np.arange(len(data))
     idx_train, idx_tmp = train_test_split(idx, test_size=0.20, random_state=42)
     idx_dev, idx_test  = train_test_split(idx_tmp, test_size=0.50, random_state=42)
-
-    print(f"Split: Train={len(idx_train)}, Dev={len(idx_dev)}, Test={len(idx_test)}")
 
     # ---------------------------
     # 3. Padding
@@ -188,16 +180,22 @@ def main():
     y_train_s = scale(y_train)
     y_dev_s   = scale(y_dev)
 
-    # ---------------------------
-    # 5. Stage 1
-    # ---------------------------
-    model = build_transfer_model(FLAGS.viscosity_model_path, freeze_base=True)
+    # ========================================================
+    # Stage 1：冻结 base，仅训练 head
+    # ========================================================
+
+    model = build_transfer_model(FLAGS.viscosity_model_path)
+
+    for layer in model.layers:
+        if not layer.name.startswith("mp_") and layer.name != "melting_point":
+            layer.trainable = False
+
     model.compile(
         optimizer=tf.keras.optimizers.Adam(FLAGS.lr_stage1),
         loss=tf.keras.losses.Huber(delta=1.0),
     )
 
-    model.fit(
+    history_stage1 = model.fit(
         x_train, y_train_s,
         validation_data=(x_dev, y_dev_s),
         epochs=1000,
@@ -209,9 +207,10 @@ def main():
         verbose=0,
     )
 
-    # ---------------------------
-    # 6. Stage 2
-    # ---------------------------
+    # ========================================================
+    # Stage 2：解冻部分 GNN 层
+    # ========================================================
+
     UNFREEZE_KEYS = [
         "cat_bmm_2", "cat_bmm_3",
         "an_bmm_2", "an_bmm_3",
@@ -229,7 +228,7 @@ def main():
         loss=tf.keras.losses.Huber(delta=1.0),
     )
 
-    model.fit(
+    history_stage2 = model.fit(
         x_train, y_train_s,
         validation_data=(x_dev, y_dev_s),
         epochs=1000,
@@ -241,9 +240,23 @@ def main():
         verbose=0,
     )
 
-    # ---------------------------
-    # 7. 评估
-    # ---------------------------
+    # ========================================================
+    # 保存 history（用于 Notebook & 论文）
+    # ========================================================
+
+    with open(RESULTS_DIR / "melting_point_transfer_history.pkl", "wb") as f:
+        pickle.dump(
+            {
+                "stage1": history_stage1.history,
+                "stage2": history_stage2.history,
+            },
+            f,
+        )
+
+    # ========================================================
+    # 评估
+    # ========================================================
+
     print("\nFinal evaluation:")
     for name, x_, y_ in [
         ("Train", x_train, y_train),
@@ -256,9 +269,10 @@ def main():
             f"MAE={np.mean(np.abs(y_ - pred)):.2f}"
         )
 
-    # ---------------------------
-    # 8. 保存模型 + scaler
-    # ---------------------------
+    # ========================================================
+    # 保存模型 + scaler
+    # ========================================================
+
     model.save(MODELS_DIR / "melting_point_transfer_final.keras")
 
     with open(RESULTS_DIR / "melting_point_transfer_scaler.pkl", "wb") as f:
